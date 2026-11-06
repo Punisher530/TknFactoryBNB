@@ -8,18 +8,17 @@ pragma solidity 0.8.38;
  * fixed in bytecode. No chain, router, factory, WBNB, LP receiver, owner,
  * blacklist, migration admin, or fee-rate configuration.
  *
- * v1.4 atomic graduation with non-blocking price visibility (Livo-style execution): the *final buy* must
- * execute the complete PancakeSwap V2 initial LP mint and token unlock in the
- * same transaction, or the purchase and all of its effects revert.
- *
- * There is NO separate graduate() call, READY phase, 48-hour expiry,
- * permissionless migration, or emergency-unwind phase.
- * An unavailable DEX can block the finishing purchase; until it succeeds,
- * earlier curve holders can still sell normally.
+ * Experimental isolated candidate: the final buy completes the curve without
+ * calling PancakeSwap. Anyone may then call graduate() to atomically seed LP.
+ * If migration fails, ONLY the graduate() transaction reverts; curve holders
+ * may still sell, which reopens buying and invalidates the pending graduation.
+ * There is no READY sell lock, 48-hour expiry, or privileged recovery function.
+ * WARNING: sells can race and invalidate graduate() until the curve is full again.
+ * No guaranteed keeper funding or automatic graduation is provided.
  * WARNING: such WBNB donations affect DEX opening price. Never assume LP
  * opening price exactly equals the terminal bonding-curve spot price.
  *
- * v1.4 ONLY adds non-blocking DEX opening-price preview and event reporting.
+ * v1.4 price-preview logic is preserved unchanged in this prototype.
  * External WBNB donations remain in the pool; price reporting is not a price cap.
  * SECURITY STATUS: EXPERIMENTAL / MAINNET HOLD.
  * Real compiler, BSC-fork, gas, MEV, and security tests required before real funds.
@@ -182,6 +181,9 @@ contract BNBBondingLaunchpadV14 {
         uint256 tokensIntoLP, uint256 nativeIntoLP,
         uint256 lpTokensMinted, address lpRecipient
     );
+    // Emitted on an exhausted curve; migration is separately permissionless.
+    // A later sell can reopen the curve before graduate() is executed.
+    event GraduationReady(address indexed token, uint256 nativeReserve);
     event NativeCreditClaimed(address indexed account, uint256 amount);
     event FeesClaimed(address indexed recipient, uint256 amount);
     // Donated WBNB remains in the pool and changes the opening DEX price.
@@ -262,8 +264,8 @@ contract BNBBondingLaunchpadV14 {
         return _createToken(name_, symbol_, metadataURI);
     }
 
-    // Creator token deployment and buy are atomic; if initial buy also finishes
-    // curve, its PancakeSwap graduation must succeed in that same transaction.
+    // Creator token deployment and buy are atomic; a finishing buy never calls
+    // PancakeSwap in this candidate. Graduation is a separate transaction.
     function createTokenAndBuy(
         string calldata name_, string calldata symbol_, string calldata metadataURI,
         uint256 minInitialTokensOut, uint256 deadline
@@ -320,12 +322,9 @@ contract BNBBondingLaunchpadV14 {
         if (refund != 0) nativeCredits[buyer] += refund;
         require(BNBBondingTokenV14(token).transfer(buyer, quoted), "TOKEN_TRANSFER_FAILED");
         emit Bought(token, buyer, used, quoted, fee, refund);
-        // The final purchase, LP mint, and transfer unlock are ALL OR NOTHING.
-        // Called internally under buy()/createTokenAndBuy() nonReentrant guard.
-        // If the pair, wrapping, minting, or validation fails, the entire buy
-        // (including fee accrual, refund credit, balances, and TokenCreated
-        // for createTokenAndBuy) rolls back.
-        if (completed) _graduateAtomic(token, m);
+        // No DEX dependency on the finishing purchase. If migration later
+        // fails, the buyer still owns purchased tokens and may sell to the curve.
+        if (completed) emit GraduationReady(token, m.nativeReserve);
         return quoted;
     }
 
@@ -352,16 +351,21 @@ contract BNBBondingLaunchpadV14 {
     }
 
     /**
-     * Internal atomic PancakeSwap V2 graduation on the buy that sells out
-     * the curve. No external keeper, terminal timeout, or unwind necessary.
-     *
-     * Directly mint initial LP rather than Router02's amount-selection logic,
-     * which fails on an otherwise-empty pair with synchronized WBNB reserves.
-     * The known limitation is that third-party WBNB donations shift opening
-     * liquidity price. No on-chain cap is used since it recreates the DoS.
-     *
-     * Invoked under the caller's nonReentrant guard. ALL external changes
-     * and preceding buy effects atomically revert if the migration fails.
+     * Anyone may retry liquidity seeding after the curve is exhausted.
+     * Reverting on a bad DEX leaves the curve ungraduated; holders may sell.
+     * A sell before this transaction makes curveTokensRemaining nonzero and
+     * this call reverts without touching the accumulated BNB reserve.
+     */
+    function graduate(address token) external onlyBSC nonReentrant {
+        Market storage m = _activeMarket(token);
+        _graduateAtomic(token, m);
+    }
+
+    /**
+     * Atomic PancakeSwap V2 graduation in its OWN transaction, not the buy.
+     * Direct LP minting tolerates WBNB donations, which alter opening price.
+     * If any step fails, the entire graduation transaction reverts and users
+     * retain their bonding-curve exit via sell() (but racing sells can delay LP).
      */
     function _graduateAtomic(address token, Market storage m) internal {
         // Defend future refactors from making partial or premature migration.
@@ -370,7 +374,7 @@ contract BNBBondingLaunchpadV14 {
         if (nativeForLP == 0) revert NotEnoughNative();
 
         (address pair, uint256 existingWBNB) = _checkedGraduationPair(token);
-        // Effects first, then external calls. All modifications revert atomically.
+        // Effects first, then external calls. Migration effects revert atomically.
         m.graduated = true;
         m.nativeReserve = 0;
         IWBNBV14(WBNB).deposit{value: nativeForLP}();
@@ -489,8 +493,7 @@ contract BNBBondingLaunchpadV14 {
         (nativeOut, fee, , ) = _quoteSell(markets[token], tokensIn);
     }
 
-    // Frontend: buyers should flag completesCurve and estimate the additional
-    // PancakeSwap pair-creation + liquidity-mint gas before the final buy.
+    // Frontend: a completing buy emits GraduationReady; graduate() is separate.
     function grossNativeToFinish(address token) external view returns (uint256) {
         if (!isLaunchToken[token] || markets[token].graduated || markets[token].curveTokensRemaining == 0) return 0;
         Market storage m = markets[token];
