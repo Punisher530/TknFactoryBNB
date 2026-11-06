@@ -1,5 +1,14 @@
 # BNB Launchpad v1.4: graduation unavailability experiment
 
+> **SECURITY GATE FAILED: DO NOT MERGE.** A one-wei token sale can reopen a completed curve and invalidate a queued permissionless graduation transaction. The branch is retained for analysis only. The proposed split migration is **not an approved fix**.
+
+## Additional confirmed model finding: one-wei sale griefing
+
+For an initial 0.25 BNB virtual reserve, immediately after the finishing buy the curve has zero remaining tokens and roughly 0.75 BNB in real reserves. An existing token holder can sell **one token wei** (10^-18 token), receive **one wei of BNB credit**, and increase `curveTokensRemaining` to one. The separately submitted `graduate()` then fails `NotReadyForGraduation`. A two-wei BNB repurchase can restore exhausted status. This can be repeated, paying network gas and trivial trading amounts. The demonstrated behavior is model-based, not a measured mainnet MEV exploit. The test is `tests/test_migration_sell_race.py`.
+
+This makes a permissionless grad transaction vulnerable to transaction-ordering and persistent griefing even if PancakeSwap V2 is functioning. It recreates an availability risk that v1.4's atomic graduation specifically avoided. Therefore the present candidate **must not be merged**. Any improved candidate must retain an effective anti-griefing mechanism while also providing exit/recovery on an unavailable DEX, and requires real EVM fork tests.
+
+
 **Branch:** `fix/graduation-unavailability-prototype`  
 **Base:** `main` (`6b6b9dd314f90f6e0375cc9f475b1af08b60e61a`)  
 **Status:** EXPERIMENTAL. DO NOT MERGE OR DEPLOY.
